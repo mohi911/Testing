@@ -1,0 +1,160 @@
+package org.example;
+
+import java.sql.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public class DataMigration {
+
+    private static final Logger LOGGER = Logger.getLogger(DataMigration.class.getName());
+    private static final String DB_URL = "jdbc:db2://localhost:50000/YOUR_DATABASE";
+    private static final String DB_USER = "your_user";
+    private static final String DB_PASSWORD = "your_password";
+
+    public static void dataMigration(int regRefDefId) {
+        Connection connection = null;
+        PreparedStatement insertLogStmt = null;
+        PreparedStatement updateSequenceStmt = null;
+        PreparedStatement selectCursorStmt = null;
+        PreparedStatement insertAuditStmt = null;
+
+        int logSeq = 1001;
+        int batchSize = 50000;
+        String batchEnabled = "Y";
+        int insertCount = 0;
+        long refListAuditId = 0;
+
+        try {
+            // Establish the connection
+            connection = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
+            connection.setAutoCommit(false);
+
+            // Log the start of migration
+            logMigration(connection, regRefDefId, logSeq++, "Migration Started");
+
+            // Get the next audit sequence
+            String getSequenceQuery = "SELECT NEXT_VALUE FROM REF_LIST.REF_LIST_SEQUENCE WHERE NAME = 'AuditSequence'";
+            try (PreparedStatement stmt = connection.prepareStatement(getSequenceQuery)) {
+                ResultSet rs = stmt.executeQuery();
+                if (rs.next()) {
+                    refListAuditId = rs.getLong("NEXT_VALUE");
+                }
+            }
+
+            // Fetch data cursor
+            String dataCursorQuery = """
+                SELECT RD.IN_TMSTMP, RD.OUT_TMSTMP, RD.ENTRY_ID, RD.RRD_DEF_ID, RD.ENTRY_DESC, RD.ATTR_VAL_1, RD.ATTR_VAL_2, 
+                       RD.OVERRIDE_IND, RD.KERBEROS_ID, RD.EFF_TMSTMP, RD.EXP_TMSTMP, RD.ATTR_VAL_3, RD.ATTR_VAL_4, RD.ATTR_VAL_5, 
+                       RD.ATTR_VAL_6, RD.ATTR_VAL_7, RD.ATTR_VAL_8, RD.ATTR_VAL_9, RD.ATTR_VAL_10, WF.IN_TMSTMP, WF.TASK_TYPE, 
+                       WF.MAKER_KERBEROS, WF.CHECKER_KERBEROS, WF.MAKER_COMMENTS, WF.CHECKER_COMMENTS, WF.BUSINESS_REASON
+                FROM RAMP.REGREF_DATA RD
+                LEFT OUTER JOIN (
+                    SELECT RDW.ENTRY_ID, RW.IN_TMSTMP, RDW.TASK_TYPE, RW.MAKER_KERBEROS, RW.CHECKER_KERBEROS, RW.MAKER_COMMENTS, 
+                           RW.CHECKER_COMMENTS, RW.BUSINESS_REASON
+                    FROM RAMP.REGREF_WORKFLOW_ENTRY RDW, RAMP.REGREF_WORKFLOW RW
+                    WHERE RDW.WORKFLOW_ID = RW.WORKFLOW_ID AND RDW.OUT_TMSTMP > CURRENT TIMESTAMP AND RW.OUT_TMSTMP > CURRENT TIMESTAMP
+                ) WF ON RD.ENTRY_ID = WF.ENTRY_ID AND SUBSTR(RD.IN_TMSTMP, 1, 16) = SUBSTR(WF.IN_TMSTMP, 1, 16)
+                WHERE RD.RRD_DEF_ID = ? ORDER BY RD.IN_TMSTMP FOR FETCH ONLY
+            """;
+            selectCursorStmt = connection.prepareStatement(dataCursorQuery);
+            selectCursorStmt.setInt(1, regRefDefId);
+            ResultSet dataCursor = selectCursorStmt.executeQuery();
+
+            // Process each row in the cursor
+            while (dataCursor.next()) {
+                long entryId = dataCursor.getLong("ENTRY_ID");
+                Timestamp inTimestamp = dataCursor.getTimestamp("IN_TMSTMP");
+                Timestamp outTimestamp = dataCursor.getTimestamp("OUT_TMSTMP");
+                String taskType = dataCursor.getString("TASK_TYPE");
+                String makerKerberos = dataCursor.getString("MAKER_KERBEROS");
+                String makerComments = dataCursor.getString("MAKER_COMMENTS");
+                String businessReason = dataCursor.getString("BUSINESS_REASON");
+                String checkerKerberos = dataCursor.getString("CHECKER_KERBEROS");
+                String checkerComments = dataCursor.getString("CHECKER_COMMENTS");
+
+                // Generate audit entry
+                long auditId = refListAuditId++;
+                insertAudit(connection, auditId, taskType, makerKerberos, makerComments + businessReason, checkerKerberos, checkerComments, inTimestamp);
+
+
+                // Handle batch insert logic
+                insertCount++;
+                if (insertCount % batchSize == 0 && "Y".equalsIgnoreCase(batchEnabled)) {
+                    logMigration(connection, regRefDefId, logSeq++, "Incremental Update, inserted " + insertCount + " rows");
+                    connection.commit();
+                }
+            }
+
+            // Finalize the process
+            updateAuditSequence(connection, refListAuditId);
+            logMigration(connection, regRefDefId, logSeq++, "Migration Completed, inserted " + insertCount + " rows");
+            if ("Y".equalsIgnoreCase(batchEnabled)) {
+                connection.commit();
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Error during data migration", e);
+            if (connection != null) {
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackEx) {
+                    LOGGER.log(Level.SEVERE, "Error during rollback", rollbackEx);
+                }
+            }
+        } finally {
+            // Clean up resources
+            closeResources(insertLogStmt, updateSequenceStmt, selectCursorStmt, insertAuditStmt, connection);
+        }
+    }
+
+    private static void logMigration(Connection connection, int regRefDefId, int logSeq, String message) throws SQLException {
+        String insertLogQuery = "INSERT INTO REF_LIST.MIGRATION_LOG (ID, SEQ, IN_Z, MESSAGE) VALUES (?, ?, CURRENT TIMESTAMP, ?)";
+        try (PreparedStatement stmt = connection.prepareStatement(insertLogQuery)) {
+            stmt.setInt(1, regRefDefId);
+            stmt.setInt(2, logSeq);
+            stmt.setString(3, message);
+            stmt.executeUpdate();
+        }
+    }
+
+    private static void insertAudit(Connection connection, long auditId, String operation, String requestedBy, String businessReason,
+                                    String approvedBy, String approvalComment, Timestamp addTimestamp) throws SQLException {
+        String insertAuditQuery = """
+            INSERT INTO REF_LIST.AUDIT (ID, OPERATION, REQUESTED_BY, BUSINESS_REASON, APPROVED_BY, APPROVAL_COMMENT, ADD_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """;
+        try (PreparedStatement stmt = connection.prepareStatement(insertAuditQuery)) {
+            stmt.setLong(1, auditId);
+            stmt.setString(2, operation != null ? operation : "UNKNOWN");
+            stmt.setString(3, requestedBy != null ? requestedBy : "SYSTEM");
+            stmt.setString(4, businessReason != null ? businessReason : "NA");
+            stmt.setString(5, approvedBy != null ? approvedBy : "SYSTEM");
+            stmt.setString(6, approvalComment != null ? approvalComment : "NA");
+            stmt.setTimestamp(7, addTimestamp != null ? addTimestamp : new Timestamp(System.currentTimeMillis()));
+            stmt.executeUpdate();
+        }
+    }
+
+    private static void updateAuditSequence(Connection connection, long nextValue) throws SQLException {
+        String updateSequenceQuery = "UPDATE REF_LIST.REF_LIST_SEQUENCE SET NEXT_VALUE = ? WHERE NAME = 'AuditSequence'";
+        try (PreparedStatement stmt = connection.prepareStatement(updateSequenceQuery)) {
+            stmt.setLong(1, nextValue);
+            stmt.executeUpdate();
+        }
+    }
+
+    private static void closeResources(AutoCloseable... resources) {
+        for (AutoCloseable resource : resources) {
+            if (resource != null) {
+                try {
+                    resource.close();
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Error closing resource", e);
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        dataMigration(123); // Example invocation
+    }
+}
